@@ -111,13 +111,14 @@ func (p *Proxy) BuildRequest(openAIReq api.OpenAIChatRequest) (api.CCRequestBody
 		Taste:  "",
 		Skills: "",
 		Params: api.CCChatParams{
-			Model:       model,
-			Messages:    ccMessages,
-			Tools:       tools,
-			System:      system,
-			MaxTokens:   maxTokens,
-			Temperature: temperature,
-			Stream:      true,
+			Model:           model,
+			Messages:        ccMessages,
+			Tools:           tools,
+			System:          system,
+			MaxTokens:       maxTokens,
+			Temperature:     temperature,
+			Stream:          true,
+			ReasoningEffort: ResolveReasoningEffort(model, openAIReq.ReasoningEffort),
 		},
 		ThreadID: uuid.New().String(),
 	}
@@ -293,6 +294,23 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 				Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
 			})
 
+		case "reasoning-delta":
+			if event.Text == "" {
+				break
+			}
+			delta := api.OpenAIDelta{ReasoningContent: event.Text, Reasoning: event.Text}
+			if !sentRole {
+				delta.Role = "assistant"
+				sentRole = true
+			}
+			p.WriteSSE(w, flusher, api.OpenAIChatResponse{
+				ID:      requestID,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   model,
+				Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
+			})
+
 		case "tool-use":
 			toolCalls := []api.OpenAIDeltaToolCall{{
 				Index:    toolCallIndex,
@@ -443,6 +461,7 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 
 	var content strings.Builder
+	var reasoning strings.Builder
 	var inputTokens, outputTokens int
 	var hasToolCalls bool
 	var toolCalls []api.ToolCall
@@ -464,6 +483,8 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 		switch event.Type {
 		case "text-delta":
 			content.WriteString(event.Text)
+		case "reasoning-delta":
+			reasoning.WriteString(event.Text)
 		case "tool-use":
 			hasToolCalls = true
 			toolCallByID[event.ToolCallID] = len(toolCalls)
@@ -535,6 +556,10 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 	msg := &api.OpenAIMessage{
 		Role:    "assistant",
 		Content: content.String(),
+	}
+	if reasoning.Len() > 0 {
+		msg.ReasoningContent = reasoning.String()
+		msg.Reasoning = reasoning.String()
 	}
 	finishReason := "stop"
 	if hasToolCalls {
@@ -623,8 +648,24 @@ func responsesToChatRequest(req api.OpenAIResponsesRequest) api.OpenAIChatReques
 		ResponseFormat:      req.ResponseFormat,
 		Stop:                req.Stop,
 		TopP:                req.TopP,
+		ReasoningEffort:     responsesReasoningEffort(req),
 		User:                req.User,
 	}
+}
+
+// responsesReasoningEffort extracts the reasoning effort from a Responses API
+// request, accepting either a top-level "reasoning_effort" string or the
+// "reasoning": {"effort": "..."} object used by the OpenAI Responses API.
+func responsesReasoningEffort(req api.OpenAIResponsesRequest) string {
+	if req.ReasoningEffort != "" {
+		return req.ReasoningEffort
+	}
+	if r, ok := req.Reasoning.(map[string]any); ok {
+		if effort, ok := r["effort"].(string); ok {
+			return effort
+		}
+	}
+	return ""
 }
 
 func responsesInputToMessages(input any) []api.OpenAIMessage {

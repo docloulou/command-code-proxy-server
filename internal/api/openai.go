@@ -3,13 +3,15 @@ package api
 // OpenAI-compatible types (client-facing)
 
 type OpenAIMessage struct {
-	Role       string        `json:"role"`
-	Content    interface{}   `json:"content,omitempty"`
-	Name       string        `json:"name,omitempty"`
-	ToolCalls  []ToolCall    `json:"tool_calls,omitempty"`
-	ToolCallID string        `json:"tool_call_id,omitempty"`
-	Refusal    string        `json:"refusal,omitempty"`
-	Audio      *MessageAudio `json:"audio,omitempty"`
+	Role             string        `json:"role"`
+	Content          interface{}   `json:"content,omitempty"`
+	ReasoningContent string        `json:"reasoning_content,omitempty"`
+	Reasoning        string        `json:"reasoning,omitempty"`
+	Name             string        `json:"name,omitempty"`
+	ToolCalls        []ToolCall    `json:"tool_calls,omitempty"`
+	ToolCallID       string        `json:"tool_call_id,omitempty"`
+	Refusal          string        `json:"refusal,omitempty"`
+	Audio            *MessageAudio `json:"audio,omitempty"`
 }
 
 type ContentPart struct {
@@ -57,6 +59,7 @@ type OpenAIChatRequest struct {
 	TopP                *float64        `json:"top_p,omitempty"`
 	PresencePenalty     *float64        `json:"presence_penalty,omitempty"`
 	FrequencyPenalty    *float64        `json:"frequency_penalty,omitempty"`
+	ReasoningEffort     string          `json:"reasoning_effort,omitempty"`
 	User                string          `json:"user,omitempty"`
 }
 
@@ -75,6 +78,8 @@ type OpenAIResponsesRequest struct {
 	ResponseFormat      any      `json:"response_format,omitempty"`
 	Stop                any      `json:"stop,omitempty"`
 	TopP                *float64 `json:"top_p,omitempty"`
+	ReasoningEffort     string   `json:"reasoning_effort,omitempty"`
+	Reasoning           any      `json:"reasoning,omitempty"`
 	User                string   `json:"user,omitempty"`
 }
 
@@ -86,10 +91,12 @@ type OpenAIChoice struct {
 }
 
 type OpenAIDelta struct {
-	Role      string                `json:"role,omitempty"`
-	Content   string                `json:"content,omitempty"`
-	ToolCalls []OpenAIDeltaToolCall `json:"tool_calls,omitempty"`
-	Refusal   string                `json:"refusal,omitempty"`
+	Role             string                `json:"role,omitempty"`
+	Content          string                `json:"content,omitempty"`
+	ReasoningContent string                `json:"reasoning_content,omitempty"`
+	Reasoning        string                `json:"reasoning,omitempty"`
+	ToolCalls        []OpenAIDeltaToolCall `json:"tool_calls,omitempty"`
+	Refusal          string                `json:"refusal,omitempty"`
 }
 
 type OpenAIDeltaToolCall struct {

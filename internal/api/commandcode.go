@@ -26,13 +26,14 @@ type CCMessage struct {
 }
 
 type CCChatParams struct {
-	Model       string      `json:"model"`
-	Messages    []CCMessage `json:"messages"`
-	Tools       []any       `json:"tools"`
-	System      string      `json:"system"`
-	MaxTokens   int         `json:"max_tokens"`
-	Temperature float64     `json:"temperature"`
-	Stream      bool        `json:"stream"`
+	Model           string      `json:"model"`
+	Messages        []CCMessage `json:"messages"`
+	Tools           []any       `json:"tools"`
+	System          string      `json:"system"`
+	MaxTokens       int         `json:"max_tokens"`
+	Temperature     float64     `json:"temperature"`
+	Stream          bool        `json:"stream"`
+	ReasoningEffort string      `json:"reasoning_effort,omitempty"`
 }
 
 type CCConfig struct {

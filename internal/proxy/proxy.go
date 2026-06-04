@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -143,7 +144,11 @@ func (p *Proxy) CreateUpstreamRequest(ctx context.Context, ccBody api.CCRequestB
 
 	ccReq.Header.Set("Content-Type", "application/json")
 	ccReq.Header.Set("Authorization", "Bearer "+apiKey)
-	ccReq.Header.Set("x-command-code-version", version.GetCommandCodeVersion())
+	ccVersion := version.GetCommandCodeVersion()
+	if envCC := os.Getenv("CC_VERSION"); envCC != "" {
+		ccVersion = envCC
+	}
+	ccReq.Header.Set("x-command-code-version", ccVersion)
 	ccReq.Header.Set("x-cli-environment", "production")
 	ccReq.Header.Set("Accept", "text/event-stream")
 

@@ -1,8 +1,12 @@
 package server
 
 import (
+	"context"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/dev2k6/command-code-proxy-server/internal/proxy"
@@ -73,10 +77,42 @@ func logger(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// Start starts the HTTP server
+// Start starts the HTTP server and blocks until it receives an interrupt or
+// termination signal, then shuts down gracefully.
+//
+// Note: WriteTimeout is intentionally left unset. Streaming (SSE) responses can
+// stay open far longer than any fixed write deadline; a non-zero WriteTimeout
+// would abruptly cut long completions. ReadHeaderTimeout still guards against
+// slow-header (Slowloris) clients and IdleTimeout reaps idle keep-alive conns.
 func (s *Server) Start() {
 	addr := s.Host + ":" + s.Port
-	if err := http.ListenAndServe(addr, s.Handler); err != nil {
+	httpServer := &http.Server{
+		Addr:              addr,
+		Handler:           s.Handler,
+		ReadHeaderTimeout: 15 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			serverErr <- err
+		}
+	}()
+
+	select {
+	case err := <-serverErr:
 		log.Fatalf("Server failed: %v", err)
+	case <-ctx.Done():
+		stop()
+		log.Println("Shutting down server...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
+			log.Printf("Graceful shutdown failed: %v", err)
+		}
 	}
 }

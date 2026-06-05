@@ -138,6 +138,89 @@ func strPtr(s string) *string {
 	return &s
 }
 
+// imageContentPart converts an OpenAI/Anthropic-style image content part into a
+// CommandCode image part instead of flattening it to text. It understands the
+// OpenAI `image_url` shapes ({"image_url": {"url": ...}} or {"image_url": "..."}),
+// the Responses API `input_image` ({"image_url": ...}), the AI SDK `image`
+// field, and the Anthropic `source` base64 shape. It returns ok=false when no
+// usable image reference can be extracted so the caller can fall back to text.
+func imageContentPart(partMap map[string]any) (api.CCContentPart, bool) {
+	url, mediaType := extractImageRef(partMap)
+	if url == "" {
+		return api.CCContentPart{}, false
+	}
+	part := api.CCContentPart{Type: "image", Image: url}
+	if mediaType == "" {
+		mediaType = mediaTypeFromDataURL(url)
+	}
+	if mediaType != "" {
+		part.MediaType = strPtr(mediaType)
+	}
+	return part, true
+}
+
+// extractImageRef pulls an image URL (http(s) or data URL) and optional media
+// type out of the many content-part shapes clients send.
+func extractImageRef(partMap map[string]any) (url, mediaType string) {
+	switch v := partMap["image_url"].(type) {
+	case string:
+		if v != "" {
+			return v, ""
+		}
+	case map[string]any:
+		if u, ok := v["url"].(string); ok && u != "" {
+			return u, ""
+		}
+	}
+
+	switch v := partMap["image"].(type) {
+	case string:
+		if v != "" {
+			return v, ""
+		}
+	case map[string]any:
+		if u, ok := v["url"].(string); ok && u != "" {
+			return u, ""
+		}
+	}
+
+	if u, ok := partMap["url"].(string); ok && u != "" {
+		return u, ""
+	}
+
+	// Anthropic style: {"source": {"type": "base64", "media_type": ..., "data": ...}}
+	if src, ok := partMap["source"].(map[string]any); ok {
+		mt, _ := src["media_type"].(string)
+		if data, ok := src["data"].(string); ok && data != "" {
+			if strings.HasPrefix(data, "data:") {
+				return data, mt
+			}
+			if mt != "" {
+				return "data:" + mt + ";base64," + data, mt
+			}
+			return data, mt
+		}
+		if u, ok := src["url"].(string); ok && u != "" {
+			return u, mt
+		}
+	}
+
+	return "", ""
+}
+
+// mediaTypeFromDataURL returns the MIME type embedded in a data URL, e.g.
+// "image/png" for "data:image/png;base64,....". It returns "" for non-data URLs.
+func mediaTypeFromDataURL(url string) string {
+	if !strings.HasPrefix(url, "data:") {
+		return ""
+	}
+	rest := strings.TrimPrefix(url, "data:")
+	if i := strings.IndexAny(rest, ";,"); i >= 0 {
+		return rest[:i]
+	}
+	return ""
+}
+
 func contentToString(content interface{}) string {
 	switch v := content.(type) {
 	case nil:
@@ -225,7 +308,9 @@ func parseContent(content interface{}, toolNames map[string]string) []api.CCCont
 					parts = append(parts, api.CCContentPart{Type: "text", Text: strPtr(text)})
 				}
 			case "image_url", "input_image", "image":
-				if text := contentPartToString(partMap); text != "" {
+				if part, ok := imageContentPart(partMap); ok {
+					parts = append(parts, part)
+				} else if text := contentPartToString(partMap); text != "" {
 					parts = append(parts, api.CCContentPart{Type: "text", Text: strPtr(text)})
 				}
 			case "tool_use", "tool-call":

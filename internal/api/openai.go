@@ -20,6 +20,12 @@ type ContentPart struct {
 	ImageURL *ImageURL `json:"image_url,omitempty"`
 }
 
+// StreamOptions mirrors OpenAI's "stream_options" object. When IncludeUsage is
+// true, a final usage-only chunk is emitted before the "[DONE]" sentinel.
+type StreamOptions struct {
+	IncludeUsage bool `json:"include_usage,omitempty"`
+}
+
 type ImageURL struct {
 	URL        string `json:"url"`
 	Detail     string `json:"detail,omitempty"`
@@ -50,7 +56,7 @@ type OpenAIChatRequest struct {
 	MaxTokens           *int            `json:"max_tokens,omitempty"`
 	MaxCompletionTokens *int            `json:"max_completion_tokens,omitempty"`
 	Stream              bool            `json:"stream,omitempty"`
-	StreamOptions       any             `json:"stream_options,omitempty"`
+	StreamOptions       *StreamOptions  `json:"stream_options,omitempty"`
 	Tools               []any           `json:"tools,omitempty"`
 	ToolChoice          any             `json:"tool_choice,omitempty"`
 	ParallelToolCalls   *bool           `json:"parallel_tool_calls,omitempty"`

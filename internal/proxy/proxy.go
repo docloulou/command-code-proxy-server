@@ -5,9 +5,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -19,8 +21,22 @@ import (
 )
 
 const defaultBaseURL = "https://api.commandcode.ai"
-const defaultTimeout = 300 * time.Second
 const debugLogLimit = 20000
+
+// Upstream resiliency tuning. The HTTP client intentionally has no overall
+// timeout so that long-lived streaming responses are not cut off mid-flight;
+// instead, per-phase transport timeouts and the inbound request context bound
+// the request lifetime.
+const (
+	dialTimeout           = 30 * time.Second
+	responseHeaderTimeout = 120 * time.Second
+	idleConnTimeout       = 90 * time.Second
+	tlsHandshakeTimeout   = 10 * time.Second
+
+	maxUpstreamRetries = 2
+	retryBaseDelay     = 400 * time.Millisecond
+	retryMaxDelay      = 4 * time.Second
+)
 
 func truncateLog(s string) string {
 	if len(s) <= debugLogLimit {
@@ -69,10 +85,29 @@ type Proxy struct {
 
 // NewProxy creates a new proxy instance
 func NewProxy(apiKey string) *Proxy {
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   dialTimeout,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   10,
+		IdleConnTimeout:       idleConnTimeout,
+		TLSHandshakeTimeout:   tlsHandshakeTimeout,
+		ResponseHeaderTimeout: responseHeaderTimeout,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
 	return &Proxy{
 		APIKey:  apiKey,
 		BaseURL: defaultBaseURL,
-		Client:  &http.Client{Timeout: defaultTimeout},
+		// No Client.Timeout on purpose: streaming responses must be allowed to
+		// outlive any fixed deadline. Cancellation is driven by the request
+		// context; stalls before the first byte are bounded by the transport's
+		// dial and response-header timeouts.
+		Client: &http.Client{Transport: transport},
 	}
 }
 
@@ -164,6 +199,76 @@ func (p *Proxy) CallUpstream(req *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
+// CallUpstreamWithRetry sends the request and retries transient failures
+// (network errors and 429/5xx-class statuses) with exponential backoff. It is
+// safe because retries happen before any bytes are streamed to the client and
+// the request body is rebuilt from the in-memory CC payload on each attempt.
+func (p *Proxy) CallUpstreamWithRetry(ctx context.Context, ccBody api.CCRequestBody, apiKey string) (*http.Response, error) {
+	var lastErr error
+
+	for attempt := 0; attempt <= maxUpstreamRetries; attempt++ {
+		if attempt > 0 {
+			delay := backoffDelay(attempt)
+			p.debugf("[DEBUG] retrying upstream (attempt %d/%d) after %s: %v", attempt, maxUpstreamRetries, delay, lastErr)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+
+		req, err := p.CreateUpstreamRequest(ctx, ccBody, apiKey)
+		if err != nil {
+			return nil, err
+		}
+
+		resp, err := p.Client.Do(req)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			lastErr = fmt.Errorf("upstream error: %w", err)
+			continue
+		}
+
+		if attempt < maxUpstreamRetries && shouldRetryStatus(resp.StatusCode) {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			lastErr = fmt.Errorf("upstream returned status %d", resp.StatusCode)
+			continue
+		}
+
+		return resp, nil
+	}
+
+	if lastErr == nil {
+		lastErr = errors.New("upstream request failed")
+	}
+	return nil, lastErr
+}
+
+// shouldRetryStatus reports whether an HTTP status code is worth retrying.
+func shouldRetryStatus(status int) bool {
+	switch status {
+	case http.StatusTooManyRequests, // 429
+		http.StatusBadGateway,         // 502
+		http.StatusServiceUnavailable, // 503
+		http.StatusGatewayTimeout:     // 504
+		return true
+	default:
+		return false
+	}
+}
+
+// backoffDelay returns an exponential backoff capped at retryMaxDelay.
+func backoffDelay(attempt int) time.Duration {
+	delay := retryBaseDelay << (attempt - 1)
+	if delay > retryMaxDelay {
+		return retryMaxDelay
+	}
+	return delay
+}
+
 // HandleChatCompletions handles the /v1/chat/completions endpoint
 func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -210,16 +315,12 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create upstream request
-	ccReq, err := p.CreateUpstreamRequest(r.Context(), ccBody, apiKey)
+	// Call upstream with retry/backoff for transient failures.
+	ccResp, err := p.CallUpstreamWithRetry(r.Context(), ccBody, apiKey)
 	if err != nil {
-		p.writeOpenAIError(w, http.StatusInternalServerError, "Failed to create upstream request", "server_error")
-		return
-	}
-
-	// Call upstream
-	ccResp, err := p.CallUpstream(ccReq)
-	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return
+		}
 		p.writeOpenAIError(w, http.StatusBadGateway, err.Error(), "api_error")
 		return
 	}
@@ -241,14 +342,15 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	created := time.Now().Unix()
 
 	if openAIReq.Stream {
-		p.StreamResponse(w, r, ccResp, requestID, ccBody.Params.Model, created)
+		includeUsage := openAIReq.StreamOptions != nil && openAIReq.StreamOptions.IncludeUsage
+		p.StreamResponse(w, r, ccResp, requestID, ccBody.Params.Model, created, includeUsage)
 	} else {
 		p.NonStreamResponse(w, ccResp, requestID, ccBody.Params.Model, created)
 	}
 }
 
 // StreamResponse handles streaming response from CommandCode to OpenAI SSE
-func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *http.Response, requestID, model string, created int64) {
+func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *http.Response, requestID, model string, created int64, includeUsage bool) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		p.writeOpenAIError(w, http.StatusInternalServerError, "Streaming not supported", "server_error")
@@ -258,31 +360,25 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 
-	scanner := bufio.NewScanner(ccResp.Body)
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	sentRole := false
 	toolCallIndex := 0
 	toolCallIndexes := map[string]int{}
+	var usage *api.OpenAIUsage
+	finished := false
 
-	for scanner.Scan() {
-		select {
-		case <-r.Context().Done():
-			return
-		default:
+	readErr := forEachLine(ccResp.Body, func(raw []byte) bool {
+		if r.Context().Err() != nil {
+			return false
 		}
 
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
+		event, ok := parseCCEvent(raw)
+		if !ok {
+			return true
 		}
-		p.debugf("[DEBUG] CommandCode stream line: %s", truncateLog(line))
-
-		var event api.CCStreamEvent
-		if err := json.Unmarshal([]byte(line), &event); err != nil {
-			continue
-		}
+		p.debugf("[DEBUG] CommandCode stream line: %s", truncateLog(string(bytes.TrimSpace(raw))))
 
 		switch event.Type {
 		case "text-delta":
@@ -395,7 +491,7 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 
 		case "tool-call":
 			if _, alreadyStreamed := toolCallIndexes[event.ToolCallID]; alreadyStreamed {
-				continue
+				return true
 			}
 			idx := toolCallIndex
 			toolCallIndexes[event.ToolCallID] = idx
@@ -440,17 +536,70 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 					FinishReason: &reason,
 				}},
 			})
-			fmt.Fprintf(w, "data: [DONE]\n\n")
-			flusher.Flush()
+			if event.TotalUsage != nil {
+				usage = &api.OpenAIUsage{
+					PromptTokens:     event.TotalUsage.InputTokens,
+					CompletionTokens: event.TotalUsage.OutputTokens,
+					TotalTokens:      event.TotalUsage.InputTokens + event.TotalUsage.OutputTokens,
+				}
+			}
+			if includeUsage && usage != nil {
+				p.WriteSSE(w, flusher, api.OpenAIChatResponse{
+					ID:      requestID,
+					Object:  "chat.completion.chunk",
+					Created: created,
+					Model:   model,
+					Choices: []api.OpenAIChoice{},
+					Usage:   usage,
+				})
+			}
+			p.writeSSEDone(w, flusher)
+			finished = true
+			return false
 
 		case "error":
-			log.Printf("[ERROR] Stream error: %v", event.Error)
+			msg := "upstream stream error"
+			if event.Error != nil && event.Error.Message != "" {
+				msg = event.Error.Message
+			}
+			log.Printf("[ERROR] Stream error: %s", msg)
+			p.writeSSEError(w, flusher, msg, "api_error")
+			finished = true
+			return false
 		}
+
+		return true
+	})
+
+	if readErr != nil && !errors.Is(readErr, context.Canceled) {
+		log.Printf("[ERROR] Upstream stream read error: %v", readErr)
 	}
 
-	if err := scanner.Err(); err != nil && err != io.EOF {
-		log.Printf("[ERROR] Scanner error: %v", err)
+	if finished || r.Context().Err() != nil {
+		return
 	}
+
+	// Upstream closed without a terminal "finish" event: synthesize a clean
+	// completion so the client is not left waiting for more chunks.
+	reason := "stop"
+	p.WriteSSE(w, flusher, api.OpenAIChatResponse{
+		ID:      requestID,
+		Object:  "chat.completion.chunk",
+		Created: created,
+		Model:   model,
+		Choices: []api.OpenAIChoice{{Index: 0, Delta: &api.OpenAIDelta{}, FinishReason: &reason}},
+	})
+	if includeUsage && usage != nil {
+		p.WriteSSE(w, flusher, api.OpenAIChatResponse{
+			ID:      requestID,
+			Object:  "chat.completion.chunk",
+			Created: created,
+			Model:   model,
+			Choices: []api.OpenAIChoice{},
+			Usage:   usage,
+		})
+	}
+	p.writeSSEDone(w, flusher)
 }
 
 // WriteSSE writes a Server-Sent Event
@@ -460,30 +609,84 @@ func (p *Proxy) WriteSSE(w io.Writer, flusher http.Flusher, resp api.OpenAIChatR
 	flusher.Flush()
 }
 
+// writeSSEDone writes the terminal "[DONE]" SSE sentinel.
+func (p *Proxy) writeSSEDone(w io.Writer, flusher http.Flusher) {
+	fmt.Fprint(w, "data: [DONE]\n\n")
+	flusher.Flush()
+}
+
+// writeSSEError surfaces an upstream/mid-stream error to a client that is
+// already in streaming mode (headers/200 already sent) by emitting an OpenAI
+// error payload followed by the "[DONE]" sentinel, so the client stops cleanly
+// instead of hanging on a truncated stream.
+func (p *Proxy) writeSSEError(w io.Writer, flusher http.Flusher, message, errType string) {
+	payload := api.OpenAIErrorResponse{Error: api.OpenAIError{Message: message, Type: errType}}
+	data, _ := json.Marshal(payload)
+	fmt.Fprintf(w, "data: %s\n\n", data)
+	p.writeSSEDone(w, flusher)
+}
+
+// forEachLine reads r line by line and invokes fn for each newline-delimited
+// chunk (the trailing newline is included). Unlike bufio.Scanner it has no fixed
+// token-size limit, so arbitrarily large lines (e.g. big tool inputs or base64
+// payloads) are handled without "token too long" failures. Iteration stops when
+// fn returns false or the reader is exhausted.
+func forEachLine(r io.Reader, fn func([]byte) bool) error {
+	reader := bufio.NewReaderSize(r, 64*1024)
+	for {
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			if !fn(line) {
+				return nil
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
+// parseCCEvent parses one upstream line into a CCStreamEvent. It tolerates both
+// raw NDJSON and SSE "data:" framing, and reports ok=false for blank lines, SSE
+// comments/heartbeats, and the "[DONE]" sentinel.
+func parseCCEvent(raw []byte) (api.CCStreamEvent, bool) {
+	line := bytes.TrimSpace(raw)
+	if len(line) == 0 || line[0] == ':' {
+		return api.CCStreamEvent{}, false
+	}
+	if rest, ok := bytes.CutPrefix(line, []byte("data:")); ok {
+		line = bytes.TrimSpace(rest)
+	}
+	if len(line) == 0 || bytes.Equal(line, []byte("[DONE]")) {
+		return api.CCStreamEvent{}, false
+	}
+	var event api.CCStreamEvent
+	if err := json.Unmarshal(line, &event); err != nil {
+		return api.CCStreamEvent{}, false
+	}
+	return event, true
+}
+
 // NonStreamResponse handles non-streaming response
 func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, requestID, model string, created int64) {
-	scanner := bufio.NewScanner(ccResp.Body)
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-
 	var content strings.Builder
 	var reasoning strings.Builder
 	var inputTokens, outputTokens int
 	var hasToolCalls bool
 	var toolCalls []api.ToolCall
+	var streamErr string
 	toolCallByID := map[string]int{}
 	toolInputBuffers := map[string]*strings.Builder{}
 
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
+	readErr := forEachLine(ccResp.Body, func(raw []byte) bool {
+		event, ok := parseCCEvent(raw)
+		if !ok {
+			return true
 		}
-		p.debugf("[DEBUG] CommandCode stream line: %s", truncateLog(line))
-
-		var event api.CCStreamEvent
-		if err := json.Unmarshal([]byte(line), &event); err != nil {
-			continue
-		}
+		p.debugf("[DEBUG] CommandCode stream line: %s", truncateLog(string(bytes.TrimSpace(raw))))
 
 		switch event.Type {
 		case "text-delta":
@@ -554,8 +757,30 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 				outputTokens = event.TotalUsage.OutputTokens
 			}
 		case "error":
-			log.Printf("[ERROR] Stream error: %v", event.Error)
+			if event.Error != nil && event.Error.Message != "" {
+				streamErr = event.Error.Message
+			} else {
+				streamErr = "upstream stream error"
+			}
+			log.Printf("[ERROR] Stream error: %s", streamErr)
 		}
+
+		return true
+	})
+
+	if readErr != nil {
+		log.Printf("[ERROR] Upstream stream read error: %v", readErr)
+		if streamErr == "" {
+			streamErr = "failed to read upstream response"
+		}
+	}
+
+	// Only fail the request when the upstream produced nothing usable; a partial
+	// answer that still carried an error event is returned as-is so the client
+	// keeps whatever content/tool calls arrived.
+	if streamErr != "" && content.Len() == 0 && reasoning.Len() == 0 && !hasToolCalls {
+		p.writeOpenAIError(w, http.StatusBadGateway, streamErr, "api_error")
+		return
 	}
 
 	msg := &api.OpenAIMessage{

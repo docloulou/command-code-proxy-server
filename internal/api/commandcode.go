@@ -10,6 +10,8 @@ type CCToolOutput struct {
 type CCContentPart struct {
 	Type       string        `json:"type"`
 	Text       *string       `json:"text,omitempty"`
+	Image      any           `json:"image,omitempty"`
+	MediaType  *string       `json:"mediaType,omitempty"`
 	ID         *string       `json:"id,omitempty"`
 	Name       *string       `json:"name,omitempty"`
 	Input      any           `json:"input,omitempty"`

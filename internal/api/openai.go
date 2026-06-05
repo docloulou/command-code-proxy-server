@@ -144,10 +144,12 @@ type OpenAIError struct {
 }
 
 type OpenAIModel struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
-	Created int64  `json:"created"`
-	OwnedBy string `json:"owned_by"`
+	ID            string `json:"id"`
+	Object        string `json:"object"`
+	Created       int64  `json:"created"`
+	OwnedBy       string `json:"owned_by"`
+	Name          string `json:"name,omitempty"`
+	ContextLength int    `json:"context_length,omitempty"`
 }
 
 type OpenAIModelList struct {

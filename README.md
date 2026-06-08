@@ -214,6 +214,27 @@ Unknown model names are passed through unchanged.
 3. The proxy sends the request to `https://api.commandcode.ai/alpha/generate`.
 4. CommandCode streaming NDJSON events are converted back to OpenAI-compatible SSE chunks or collected into a single JSON response.
 
+## Response metadata mapping
+
+The proxy forwards the upstream CommandCode telemetry 1:1 onto the OpenAI
+response shape (both streaming and non-streaming). Beyond the message content
+and tool calls, every completion now also carries:
+
+| OpenAI field | Source (CommandCode stream) | Meaning |
+| --- | --- | --- |
+| `usage.prompt_tokens` | `finish.totalUsage.inputTokens` | Total prompt tokens |
+| `usage.completion_tokens` | `finish.totalUsage.outputTokens` | Total completion tokens |
+| `usage.total_tokens` | `finish.totalUsage.totalTokens` | Total tokens |
+| `usage.prompt_tokens_details.cached_tokens` | `totalUsage.cachedInputTokens` / `inputTokenDetails.cacheReadTokens` | Prompt tokens served from the provider prompt cache |
+| `usage.completion_tokens_details.reasoning_tokens` | `totalUsage.reasoningTokens` / `outputTokenDetails.reasoningTokens` | Reasoning (thinking) tokens |
+| `usage.cost` | sum of `finish-step.providerMetadata.gateway.cost` | Gateway cost in USD (OpenRouter-compatible extension) |
+| `system_fingerprint` | `providerMetadata.gateway.generationId` | Upstream generation id for tracing |
+| `provider` | `providerMetadata.gateway.routing.finalProvider` | Upstream provider that served the request (OpenRouter-compatible extension) |
+
+For streaming requests, the cost/usage details are emitted on the final
+usage-only chunk when `stream_options.include_usage` is `true`; the
+`system_fingerprint` and `provider` are attached to the terminating chunks.
+
 ## Version check
 
 On startup and when running `-version`, the proxy calls:

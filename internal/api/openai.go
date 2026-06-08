@@ -117,10 +117,27 @@ type OpenAIDeltaFunction struct {
 	Arguments string `json:"arguments,omitempty"`
 }
 
+// OpenAIPromptTokensDetails mirrors OpenAI's "prompt_tokens_details", exposing
+// the cached-prompt-token count so clients can see prompt-cache hits.
+type OpenAIPromptTokensDetails struct {
+	CachedTokens int `json:"cached_tokens"`
+}
+
+// OpenAICompletionTokensDetails mirrors OpenAI's "completion_tokens_details",
+// exposing the reasoning-token count for reasoning-capable models.
+type OpenAICompletionTokensDetails struct {
+	ReasoningTokens int `json:"reasoning_tokens"`
+}
+
 type OpenAIUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens            int                            `json:"prompt_tokens"`
+	CompletionTokens        int                            `json:"completion_tokens"`
+	TotalTokens             int                            `json:"total_tokens"`
+	PromptTokensDetails     *OpenAIPromptTokensDetails     `json:"prompt_tokens_details,omitempty"`
+	CompletionTokensDetails *OpenAICompletionTokensDetails `json:"completion_tokens_details,omitempty"`
+	// Cost is the upstream gateway cost in USD (OpenRouter-compatible extension).
+	// Omitted when the upstream did not report a cost.
+	Cost float64 `json:"cost,omitempty"`
 }
 
 type OpenAIChatResponse struct {
@@ -130,6 +147,12 @@ type OpenAIChatResponse struct {
 	Model   string         `json:"model"`
 	Choices []OpenAIChoice `json:"choices"`
 	Usage   *OpenAIUsage   `json:"usage,omitempty"`
+	// SystemFingerprint carries the upstream generation id so a specific
+	// completion can be traced back to CommandCode.
+	SystemFingerprint string `json:"system_fingerprint,omitempty"`
+	// Provider is the upstream provider that actually served the request
+	// (OpenRouter-compatible extension).
+	Provider string `json:"provider,omitempty"`
 }
 
 type OpenAIErrorResponse struct {

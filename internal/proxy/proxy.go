@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -61,6 +62,66 @@ func (p *Proxy) writeOpenAIError(w http.ResponseWriter, status int, message, err
 		Param:   nil,
 		Code:    nil,
 	}})
+}
+
+// usageFromCC converts CommandCode's rich usage object into an OpenAI usage
+// object, mapping the cache and reasoning token breakdowns onto OpenAI's
+// prompt_tokens_details / completion_tokens_details. cost is the accumulated
+// gateway cost in USD (0 when unknown). It returns nil when there is no usage.
+func usageFromCC(u *api.CCUsage, cost float64) *api.OpenAIUsage {
+	if u == nil {
+		return nil
+	}
+	usage := &api.OpenAIUsage{
+		PromptTokens:     u.InputTokens,
+		CompletionTokens: u.OutputTokens,
+		TotalTokens:      u.Total(),
+		PromptTokensDetails: &api.OpenAIPromptTokensDetails{
+			CachedTokens: u.CachedTokens(),
+		},
+		CompletionTokensDetails: &api.OpenAICompletionTokensDetails{
+			ReasoningTokens: u.Reasoning(),
+		},
+	}
+	if cost > 0 {
+		usage.Cost = cost
+	}
+	return usage
+}
+
+// ccMeta accumulates gateway metadata observed across stream steps: the total
+// cost (summed across "finish-step" events), the last generation id, and the
+// resolved upstream provider.
+type ccMeta struct {
+	cost         float64
+	generationID string
+	provider     string
+}
+
+// absorb folds one provider-metadata block into the accumulator. It is only fed
+// "finish-step" metadata so the per-step costs sum correctly without double
+// counting the redundant standalone "provider-metadata" event.
+func (m *ccMeta) absorb(pm *api.CCProviderMetadata) {
+	if pm == nil || pm.Gateway == nil {
+		return
+	}
+	g := pm.Gateway
+	if g.Cost != "" {
+		if c, err := strconv.ParseFloat(g.Cost, 64); err == nil {
+			m.cost += c
+		}
+	}
+	if g.GenerationID != "" {
+		m.generationID = g.GenerationID
+	}
+	if g.Routing != nil {
+		switch {
+		case g.Routing.FinalProvider != "":
+			m.provider = g.Routing.FinalProvider
+		case g.Routing.ResolvedProvider != "":
+			m.provider = g.Routing.ResolvedProvider
+		}
+	}
 }
 
 func normalizeFinishReason(reason string) string {
@@ -368,6 +429,8 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 	toolCallIndex := 0
 	toolCallIndexes := map[string]int{}
 	var usage *api.OpenAIUsage
+	var lastStepUsage *api.CCUsage
+	meta := &ccMeta{}
 	finished := false
 
 	readErr := forEachLine(ccResp.Body, func(raw []byte) bool {
@@ -524,34 +587,42 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 				Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
 			})
 
+		case "finish-step":
+			meta.absorb(event.ProviderMetadata)
+			if event.Usage != nil {
+				lastStepUsage = event.Usage
+			}
+
 		case "finish":
 			reason := normalizeFinishReason(event.FinishReason)
 			p.WriteSSE(w, flusher, api.OpenAIChatResponse{
-				ID:      requestID,
-				Object:  "chat.completion.chunk",
-				Created: created,
-				Model:   model,
+				ID:                requestID,
+				Object:            "chat.completion.chunk",
+				Created:           created,
+				Model:             model,
+				SystemFingerprint: meta.generationID,
+				Provider:          meta.provider,
 				Choices: []api.OpenAIChoice{{
 					Index:        0,
 					Delta:        &api.OpenAIDelta{},
 					FinishReason: &reason,
 				}},
 			})
-			if event.TotalUsage != nil {
-				usage = &api.OpenAIUsage{
-					PromptTokens:     event.TotalUsage.InputTokens,
-					CompletionTokens: event.TotalUsage.OutputTokens,
-					TotalTokens:      event.TotalUsage.InputTokens + event.TotalUsage.OutputTokens,
-				}
+			ccUsage := event.TotalUsage
+			if ccUsage == nil {
+				ccUsage = lastStepUsage
 			}
+			usage = usageFromCC(ccUsage, meta.cost)
 			if includeUsage && usage != nil {
 				p.WriteSSE(w, flusher, api.OpenAIChatResponse{
-					ID:      requestID,
-					Object:  "chat.completion.chunk",
-					Created: created,
-					Model:   model,
-					Choices: []api.OpenAIChoice{},
-					Usage:   usage,
+					ID:                requestID,
+					Object:            "chat.completion.chunk",
+					Created:           created,
+					Model:             model,
+					SystemFingerprint: meta.generationID,
+					Provider:          meta.provider,
+					Choices:           []api.OpenAIChoice{},
+					Usage:             usage,
 				})
 			}
 			p.writeSSEDone(w, flusher)
@@ -560,11 +631,17 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 
 		case "error":
 			msg := "upstream stream error"
-			if event.Error != nil && event.Error.Message != "" {
-				msg = event.Error.Message
+			errType := "api_error"
+			if event.Error != nil {
+				if event.Error.Message != "" {
+					msg = event.Error.Message
+				}
+				if event.Error.Type != "" {
+					errType = event.Error.Type
+				}
 			}
 			log.Printf("[ERROR] Stream error: %s", msg)
-			p.writeSSEError(w, flusher, msg, "api_error")
+			p.writeSSEError(w, flusher, msg, errType)
 			finished = true
 			return false
 		}
@@ -584,20 +661,27 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 	// completion so the client is not left waiting for more chunks.
 	reason := "stop"
 	p.WriteSSE(w, flusher, api.OpenAIChatResponse{
-		ID:      requestID,
-		Object:  "chat.completion.chunk",
-		Created: created,
-		Model:   model,
-		Choices: []api.OpenAIChoice{{Index: 0, Delta: &api.OpenAIDelta{}, FinishReason: &reason}},
+		ID:                requestID,
+		Object:            "chat.completion.chunk",
+		Created:           created,
+		Model:             model,
+		SystemFingerprint: meta.generationID,
+		Provider:          meta.provider,
+		Choices:           []api.OpenAIChoice{{Index: 0, Delta: &api.OpenAIDelta{}, FinishReason: &reason}},
 	})
+	if usage == nil && lastStepUsage != nil {
+		usage = usageFromCC(lastStepUsage, meta.cost)
+	}
 	if includeUsage && usage != nil {
 		p.WriteSSE(w, flusher, api.OpenAIChatResponse{
-			ID:      requestID,
-			Object:  "chat.completion.chunk",
-			Created: created,
-			Model:   model,
-			Choices: []api.OpenAIChoice{},
-			Usage:   usage,
+			ID:                requestID,
+			Object:            "chat.completion.chunk",
+			Created:           created,
+			Model:             model,
+			SystemFingerprint: meta.generationID,
+			Provider:          meta.provider,
+			Choices:           []api.OpenAIChoice{},
+			Usage:             usage,
 		})
 	}
 	p.writeSSEDone(w, flusher)
@@ -675,7 +759,9 @@ func parseCCEvent(raw []byte) (api.CCStreamEvent, bool) {
 func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, requestID, model string, created int64) {
 	var content strings.Builder
 	var reasoning strings.Builder
-	var inputTokens, outputTokens int
+	var finalUsage *api.CCUsage
+	var lastStepUsage *api.CCUsage
+	meta := &ccMeta{}
 	var hasToolCalls bool
 	var toolCalls []api.ToolCall
 	var streamErr string
@@ -752,10 +838,14 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 					},
 				})
 			}
+		case "finish-step":
+			meta.absorb(event.ProviderMetadata)
+			if event.Usage != nil {
+				lastStepUsage = event.Usage
+			}
 		case "finish":
 			if event.TotalUsage != nil {
-				inputTokens = event.TotalUsage.InputTokens
-				outputTokens = event.TotalUsage.OutputTokens
+				finalUsage = event.TotalUsage
 			}
 		case "error":
 			if event.Error != nil && event.Error.Message != "" {
@@ -799,21 +889,27 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 		finishReason = "tool_calls"
 	}
 
+	if finalUsage == nil {
+		finalUsage = lastStepUsage
+	}
+	usage := usageFromCC(finalUsage, meta.cost)
+	if usage == nil {
+		usage = &api.OpenAIUsage{}
+	}
+
 	response := api.OpenAIChatResponse{
-		ID:      requestID,
-		Object:  "chat.completion",
-		Created: created,
-		Model:   model,
+		ID:                requestID,
+		Object:            "chat.completion",
+		Created:           created,
+		Model:             model,
+		SystemFingerprint: meta.generationID,
+		Provider:          meta.provider,
 		Choices: []api.OpenAIChoice{{
 			Index:        0,
 			Message:      msg,
 			FinishReason: &finishReason,
 		}},
-		Usage: &api.OpenAIUsage{
-			PromptTokens:     inputTokens,
-			CompletionTokens: outputTokens,
-			TotalTokens:      inputTokens + outputTokens,
-		},
+		Usage: usage,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
